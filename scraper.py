@@ -13,11 +13,16 @@ Key Features:
 - Built-in retry mechanism for network requests
 - Concurrent downloads with thread pooling
 - Automatic resource cleanup
+- Database integration to save manga data
+- Progress tracking with terminal progress bars
+- File-based logging with Unicode support
 
 Dependencies:
 - requests: For HTTP requests with retry capabilities
 - selectolax: For HTML parsing
 - img2pdf: For converting images to PDF
+- SQLAlchemy: For database interaction
+- tqdm: For progress bar visualization
 """
 
 import logging
@@ -32,8 +37,24 @@ from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tempfile
+from database import get_db_session, close_db_session, init_db
+from db_models import MangaDB, GenreDB, ChapterDB, ChapterImageDB, get_uuid
+from sqlalchemy.exc import IntegrityError
+from tqdm import tqdm
 
-# Configure logging for the module
+# Configure logging to file only with UTF-8 encoding
+def setup_logging():
+    """Configure logging to write to a file with UTF-8 encoding."""
+    log_file = Path(__file__).parent / "scraper.log"
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8')
+        ]
+    )
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # Global session instance for connection pooling and retry handling
@@ -176,13 +197,20 @@ class SearchResultsScraper:
         The raw HTML nodes are stored for later parsing.
         """
         html = get_html("https://azoramoon.com/", {"s": self.search, "post_type": "wp-manga"})
-        self.result_no = int(html.css_first("h1").text(strip=True).split(" ")[0])
-        self.pages = self.result_no // SearchResultsScraper.MAX_RESULTS_PER_PAGE + 1
-        self.result_nodes += html.css("div.row.c-tabs-item__content")
-        if self.pages > 1:
-            for i in range(2, self.pages + 1):
-                html = get_html(f"https://azoramoon.com/page{i}/", {"s": self.search, "post_type": "wp-manga"})
-                self.result_nodes += html.css("div.row.c-tabs-item__content")
+        try :
+            self.result_no = int(html.css_first("h1").text(strip=True).split(" ")[0])
+            self.pages = self.result_no // SearchResultsScraper.MAX_RESULTS_PER_PAGE + 1
+            self.result_nodes += html.css("div.row.c-tabs-item__content")
+            if self.pages > 1:
+                for i in range(2, self.pages + 1):
+                    html = get_html(f"https://azoramoon.com/page{i}/", {"s": self.search, "post_type": "wp-manga"})
+                    self.result_nodes += html.css("div.row.c-tabs-item__content")
+            logger.debug("Found %d results across %d pages for search: %s", self.result_no, self.pages, self.search)
+        except AttributeError :
+            self.result_no = 0
+            self.pages = 0
+            self.result_nodes = []
+            logger.debug("No results found for search: %s", self.search)
     
     def get_result(self, result_node: LexborNode) -> MangaSearchResult:
         """
@@ -282,7 +310,7 @@ class MangaDetailsScarper:
         Returns:
             str: The manga's title
         """
-        title = self.page.css_first("h1").text(strip=True)
+        title = self.page.css_first("h1").text(strip=True) or "Unknown Title"
         return title
     
     @property
@@ -293,7 +321,10 @@ class MangaDetailsScarper:
         Returns:
             str: URL of the cover image
         """
-        poster = self.page.css_first("div.summary_image a img.img-responsive").attrs["src"]
+        try :
+            poster = self.page.css_first("div.summary_image a img.img-responsive").attrs["src"]
+        except AttributeError :
+            poster = "https://placehold.it/150x200"
         return poster
     
     @property
@@ -304,7 +335,10 @@ class MangaDetailsScarper:
         Returns:
             str: Full description/summary of the manga
         """
-        description = self.page.css_first("div.manga-summary").text(strip=True)
+        try :
+            description = self.page.css_first("div.manga-summary").text(strip=True)
+        except AttributeError :
+            description = "No description available."
         return description
     
     @property
@@ -315,7 +349,10 @@ class MangaDetailsScarper:
         Returns:
             List[str]: List of genre names
         """
-        genres = [node.text(strip=True) for node in self.page.css("div.genres-content a")]
+        try :
+            genres = [node.text(strip=True) for node in self.page.css("div.genres-content a")]
+        except AttributeError :
+            genres = []
         return genres
     
     @property
@@ -326,8 +363,12 @@ class MangaDetailsScarper:
         Returns:
             str: Publication status (e.g., "Ongoing", "Completed")
         """
-        status = self.page.css_first("div.summary-content div.tags-content").text(strip=True)
+        try :
+            status = self.page.css_first("div.summary-content div.tags-content").text(strip=True)
+        except AttributeError :
+            status = "Unknown"
         return status
+    
     @property
     def rate(self) -> float:
         """
@@ -336,7 +377,10 @@ class MangaDetailsScarper:
         Returns:
             float: Average rating of the manga
         """
-        rate = self.page.css_first("span#averagerate").text(strip=True)
+        try :
+            rate = self.page.css_first("span#averagerate").text(strip=True)
+        except AttributeError :
+            rate = 0.0
         return rate
     
     @property
@@ -350,15 +394,20 @@ class MangaDetailsScarper:
         Returns:
             List[ChapterDetailed]: List of chapter objects
         """
-        chapter_nodes = self.page.css("li.wp-manga-chapter")[::-1]
-        chapters = [
-            ChapterDetailed(
-                order_no=n,
-                url=chapter_node.css_first("a").attrs["href"],
-                title=chapter_node.css_first("a").text(strip=True)
-            ) for n, chapter_node in enumerate(chapter_nodes)
-        ]
-        return chapters
+        try :
+            chapter_nodes = self.page.css("li.wp-manga-chapter")[::-1]
+            if not chapter_nodes :
+                chapters = [
+                    ChapterDetailed(
+                        order_no=n,
+                        url=chapter_node.css_first("a").attrs["href"],
+                        title=chapter_node.css_first("a").text(strip=True)
+                    ) for n, chapter_node in enumerate(chapter_nodes)
+                ]
+                return chapters
+        except AttributeError :
+            pass
+        return []
 
     @property
     def details(self) -> MangaDetails:
@@ -406,6 +455,7 @@ class ChapterImagesScraper:
             chapter_url (str): URL of the chapter to scrape
         """
         self.url = chapter_url
+        self.manga_url = "/".join(chapter_url.split("/")[:-2])
 
     @cached_property
     def images(self) -> List[ChapterImage]:
@@ -418,11 +468,9 @@ class ChapterImagesScraper:
         Returns:
             List[ChapterImage]: List of chapter images with order and URL
         """
-        logger.debug("Extracting images for %s", self.url)
         tree = get_html(self.url)
         return [ChapterImage(order_no=i, url=node.attrs["src"].strip())
                 for i, node in enumerate(tree.css("img.wp-manga-chapter-img"))]
-    
     
     @staticmethod
     def _download_to_temp(url: str, timeout: float = 15.0) -> str:
@@ -473,22 +521,18 @@ class ChapterImagesScraper:
                     url = futures[fut]
                     try:
                         tmp_files.append(fut.result())
-                        logger.debug("Downloaded %s", url)
                     except Exception:
                         logger.exception("Failed to download %s", url)
                         raise
 
-            logger.info("Converting %d images to PDF", len(tmp_files))
             with open(out_path, "wb") as f_out:
                 f_out.write(img2pdf.convert(tmp_files))
         finally:
-            # cleanup tmp files
             for p in tmp_files:
                 try:
                     Path(p).unlink()
                 except Exception:
                     logger.debug("Failed to remove temp file %s", p)
-
 
 class SerieScraper:
     """
@@ -496,7 +540,7 @@ class SerieScraper:
 
     This class provides functionality to list and fetch all manga series
     available on the site. It supports pagination and parallel fetching
-    for better performance.
+    for better performance, and can save manga data to the database.
 
     Class Attributes:
         TOTAL_RESULTS (int): Total number of manga series found
@@ -505,8 +549,8 @@ class SerieScraper:
         MAX_THREADS (int): Maximum concurrent threads for fetching
 
     Example:
-        >>> total_pages = SerieScraper.get_total_pages()
-        >>> all_manga = SerieScraper.start(total_pages)
+        >>> SerieScraper.save_all_manga()
+        >>> all_manga = SerieScraper.start()
         >>> print(f"Found {len(all_manga)} manga series")
     """
     
@@ -562,27 +606,126 @@ class SerieScraper:
         return links
     
     @staticmethod
-    def start(pages_to_fetch: int) -> Set[str]:
+    def start() -> Set[str]:
         """
         Start fetching manga links from multiple pages in parallel.
 
         This method uses a thread pool to fetch multiple pages concurrently,
-        improving the speed of collecting all manga URLs.
-
-        Args:
-            pages_to_fetch (int): Number of pages to fetch
+        improving the speed of collecting all manga URLs. Shows progress bar.
 
         Returns:
             Set[str]: Set of all unique manga URLs found
         """
-        total_pages = pages_to_fetch
+        total_pages = SerieScraper.get_total_pages()
         links: Set[str] = set()
         with ThreadPoolExecutor(max_workers=SerieScraper.MAX_THREADS) as ex:
             futures = [ex.submit(SerieScraper.get_links, page) for page in range(1, total_pages + 1)]
-            for fut in as_completed(futures):
-                try:
-                    part = fut.result()
-                    links.update(part)
-                except Exception:
-                    logger.exception("Error fetching page")
+            with tqdm(total=len(futures), desc="Fetching manga links", unit="page") as pbar:
+                for fut in as_completed(futures):
+                    try:
+                        part = fut.result()
+                        links.update(part)
+                    except Exception:
+                        logger.exception("Error fetching page")
+                    finally:
+                        pbar.update(1)
         return links
+    
+    @staticmethod
+    def _save_manga_to_db(manga_url: str) -> bool:
+        """
+        Scrape and save a single manga to the database.
+
+        Args:
+            manga_url (str): URL of the manga to scrape and save
+
+        Returns:
+            bool: True if saved successfully, False otherwise
+        """
+        session = get_db_session()
+        try:
+            # Check if manga URL already exists
+            existing = session.query(MangaDB).filter(MangaDB.url == manga_url).first()
+            if existing:
+                logger.debug("Manga already exists in database: %s", manga_url)
+                return False
+            
+            scraper = MangaDetailsScarper(manga_url)
+            details = scraper.details
+            
+            manga_id = get_uuid()
+            manga_db = MangaDB(
+                id=manga_id,
+                title=details.title,
+                url=details.url,
+                poster=details.poster,
+                description=details.description,
+                status=details.status,
+                rate=float(details.rate) if details.rate else 0.0
+            )
+            session.add(manga_db)
+            session.flush()
+            
+            for genre_name in details.genres:
+                genre_db = GenreDB(id=get_uuid(), manga_id=manga_id, name=genre_name)
+                session.add(genre_db)
+            
+            for chapter in details.chapters:
+                chapter_db = ChapterDB(
+                    id=get_uuid(),
+                    manga_id=manga_id,
+                    order_no=chapter.order_no,
+                    title=chapter.title,
+                    url=chapter.url
+                )
+                session.add(chapter_db)
+            
+            session.commit()
+            logger.info("Saved manga to database: %s", details.title)
+            return True
+            
+        except IntegrityError as e:
+            session.rollback()
+            logger.warning("Integrity error while saving manga: %s", manga_url)
+            return False
+        except Exception as e:
+            session.rollback()
+            logger.exception("Error saving manga to database: %s", manga_url)
+            return False
+        finally:
+            close_db_session(session)
+    
+    @staticmethod
+    def save_all_manga(max_workers: int = 3) -> None:
+        """
+        Fetch all manga links and save them to the database.
+
+        This method scrapes all manga series from the website and saves them
+        to the database with their details, genres, and chapters. Displays
+        progress bars for both fetching and saving operations.
+
+        Args:
+            max_workers (int): Maximum number of concurrent worker threads
+
+        Example:
+            >>> SerieScraper.save_all_manga(max_workers=5)
+        """
+        init_db()
+        logger.info("Starting manga scraping process")
+        
+        manga_links = SerieScraper.start()
+        
+        saved_count = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(SerieScraper._save_manga_to_db, url): url for url in manga_links}
+            with tqdm(total=len(futures), desc="Saving manga to database", unit="manga") as pbar:
+                for fut in as_completed(futures):
+                    try:
+                        if fut.result():
+                            saved_count += 1
+                    except Exception:
+                        logger.exception("Error processing manga")
+                    finally:
+                        pbar.update(1)
+        
+        logger.info("Completed: Saved %d new manga to database", saved_count)
